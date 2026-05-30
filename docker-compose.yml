@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  # --- PostgreSQL 15 ---
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-brandpulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-brandpulse_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-brandpulse_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - brandpulse-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-brandpulse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis 7 ---
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - brandpulse-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Flask Backend API ---
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-brandpulse}:${POSTGRES_PASSWORD:-brandpulse_secret}@postgres:5432/${POSTGRES_DB:-brandpulse_db}
+      REDIS_URL: redis://redis:6379/0
+      FLASK_ENV: ${FLASK_ENV:-production}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - brandpulse-net
+    volumes:
+      - ./backend/data:/app/data
+
+  # --- Celery Worker ---
+  celery:
+    build: ./backend
+    command: celery -A app.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-brandpulse}:${POSTGRES_PASSWORD:-brandpulse_secret}@postgres:5432/${POSTGRES_DB:-brandpulse_db}
+      REDIS_URL: redis://redis:6379/0
+      FLASK_ENV: ${FLASK_ENV:-production}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - backend
+    networks:
+      - brandpulse-net
+    volumes:
+      - ./backend/data:/app/data
+
+  # --- React Frontend (nginx) ---
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:5000
+        VITE_WS_URL: http://localhost:5000
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - brandpulse-net
+
+volumes:
+  pg_data:
+
+networks:
+  brandpulse-net:
+    driver: bridge

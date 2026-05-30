@@ -1,0 +1,17 @@
+Flask==3.0.0
+Flask-CORS==4.0.0
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy>=2.0.23
+psycopg2-binary==2.9.9
+redis==5.0.1
+pandas>=2.1.4
+Faker>=21.0.0
+marshmallow==3.20.1
+alembic==1.13.1
+gunicorn==21.2.0
+pytest==7.4.3
+Flask-SocketIO==5.3.6
+eventlet==0.33.3
+celery==5.3.4
+anthropic==0.34.0
+# azure-storage-blob==12.19.0  # Uncomment for Azure Blob Storage integration
