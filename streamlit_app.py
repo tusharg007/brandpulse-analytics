@@ -46,6 +46,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Format Currency (Defined globally to avoid NameErrors in different views)
+def format_in_inr(v):
+    if v >= 10000000:
+        return f"₹{v / 10000000:.2f} Cr"
+    elif v >= 100000:
+        return f"₹{v / 100000:.2f} L"
+    else:
+        return f"₹{v:,.2f}"
+
 # Helper function to get database connection
 def get_db_data():
     db_path = os.path.join("backend", "brandpulse_local.db")
@@ -171,15 +180,6 @@ if app_mode == "Dashboard":
     active_brands_count = filtered_df["brand_id"].nunique()
     anomalies_count = filtered_df["is_anomalous"].sum()
     
-    # Format Currency
-    def format_in_inr(v):
-        if v >= 10000000:
-            return f"₹{v / 10000000:.2f} Cr"
-        elif v >= 100000:
-            return f"₹{v / 100000:.2f} L"
-        else:
-            return f"₹{v:,.2f}"
-            
     with kpi_col1:
         st.markdown(f'<div class="metric-card">', unsafe_allow_html=True)
         st.metric("Total Revenue", format_in_inr(total_rev))
@@ -223,9 +223,10 @@ if app_mode == "Dashboard":
     with col_left:
         st.subheader("Top Brands by Revenue")
         top_b_df = filtered_df.groupby("name").agg({"revenue": "sum"}).reset_index().sort_values(by="revenue", ascending=False).head(5)
+        # Use simple string representation for color scale to avoid Plotly version discrepancies
         fig_bar = px.bar(
             top_b_df, x="revenue", y="name", orientation="h",
-            color="revenue", color_continuous_scale=px.colors.sequential.Indigo,
+            color="revenue", color_continuous_scale="Purples",
             template="plotly_dark"
         )
         fig_bar.update_layout(
