@@ -83,14 +83,37 @@ def extract_requested_limit(prompt, default=3, maximum=10):
     return max(1, min(requested, maximum))
 
 
-def top_brands_summary(dataframe, limit):
+def clean_prompt(prompt):
+    return prompt.lower().replace("@bot", " ").replace("@", " ").strip()
+
+
+def find_brand_mentions(prompt, dataframe):
+    prompt_lower = clean_prompt(prompt)
+    brand_names = sorted(dataframe["name"].dropna().unique(), key=len, reverse=True)
+    return [brand for brand in brand_names if brand.lower() in prompt_lower]
+
+
+def help_summary():
+    return (
+        "BrandBot Analysis: You can ask me direct questions about the loaded BrandPulse data. "
+        "For example:\n\n"
+        "1. **Top brands** - `list top 3 brands`\n"
+        "2. **Category leaders** - `top brands in each category`\n"
+        "3. **Anomalies** - `show anomalies by platform`\n"
+        "4. **Revenue** - `total revenue` or `revenue by platform`\n"
+        "5. **Brand details** - `tell me about SoleStrike`\n"
+        "6. **Compare brands** - `compare SoleStrike and TrailBlaze`"
+    )
+
+
+def top_brands_summary(dataframe, limit, ascending=False):
     if dataframe.empty:
         return "BrandBot Analysis: I do not have any sales rows loaded to rank brands."
 
     top_brands = (
         dataframe.groupby("name", as_index=False)
         .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"))
-        .sort_values(by="revenue", ascending=False)
+        .sort_values(by="revenue", ascending=ascending)
         .head(limit)
     )
 
@@ -98,7 +121,46 @@ def top_brands_summary(dataframe, limit):
         f"{idx}. **{row['name']}** - {format_in_inr(row['revenue'])} revenue, {int(row['units']):,} units"
         for idx, row in enumerate(top_brands.to_dict("records"), start=1)
     ]
-    return "BrandBot Analysis: Top brands by revenue:\n\n" + "\n".join(lines)
+    label = "Lowest brands by revenue" if ascending else "Top brands by revenue"
+    return f"BrandBot Analysis: {label}:\n\n" + "\n".join(lines)
+
+
+def top_brands_by_category_summary(dataframe, limit):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to rank categories."
+
+    category_totals = (
+        dataframe.groupby(["category", "name"], as_index=False)
+        .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"))
+        .sort_values(["category", "revenue"], ascending=[True, False])
+    )
+
+    lines = []
+    for category, category_df in category_totals.groupby("category", sort=True):
+        leaders = category_df.head(limit)
+        leader_text = "; ".join(
+            f"**{row['name']}** ({format_in_inr(row['revenue'])}, {int(row['units']):,} units)"
+            for row in leaders.to_dict("records")
+        )
+        lines.append(f"- **{category.title()}**: {leader_text}")
+
+    return "BrandBot Analysis: Top brands in each category:\n\n" + "\n".join(lines)
+
+
+def category_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to summarize categories."
+
+    category_totals = (
+        dataframe.groupby("category", as_index=False)
+        .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"), brands=("brand_id", "nunique"))
+        .sort_values("revenue", ascending=False)
+    )
+    lines = [
+        f"{idx}. **{row['category'].title()}** - {format_in_inr(row['revenue'])}, {int(row['units']):,} units, {int(row['brands'])} brands"
+        for idx, row in enumerate(category_totals.to_dict("records"), start=1)
+    ]
+    return "BrandBot Analysis: Category performance:\n\n" + "\n".join(lines)
 
 
 def anomaly_summary(dataframe):
@@ -117,11 +179,24 @@ def anomaly_summary(dataframe):
     top_brand = brand_counts.index[0]
     top_brand_count = int(brand_counts.iloc[0])
 
+    brand_lines = [
+        f"{idx}. **{brand}** - {count} records"
+        for idx, (brand, count) in enumerate(brand_counts.head(3).items(), start=1)
+    ]
+    platform_lines = [
+        f"{idx}. **{platform}** - {count} records"
+        for idx, (platform, count) in enumerate(platform_counts.head(3).items(), start=1)
+    ]
+
     return (
         "BrandBot Analysis: "
         f"Detected **{total_anomalies}** anomalous sales records. "
         f"Highest anomaly platform: **{top_platform}** ({top_platform_count} records). "
-        f"Most affected brand: **{top_brand}** ({top_brand_count} records)."
+        f"Most affected brand: **{top_brand}** ({top_brand_count} records).\n\n"
+        "Top anomaly brands:\n"
+        + "\n".join(brand_lines)
+        + "\n\nTop anomaly platforms:\n"
+        + "\n".join(platform_lines)
     )
 
 
@@ -139,24 +214,158 @@ def revenue_summary(dataframe):
     )
 
 
-def answer_brandbot(prompt, dataframe):
-    prompt_lower = prompt.lower()
-    if "@bot" not in prompt_lower and "bot" not in prompt_lower:
-        return "For AI assistant feedback, please prepend your prompt with **@bot**."
+def platform_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to summarize platforms."
 
-    if any(word in prompt_lower for word in ["top", "best", "highest", "rank", "leader"]):
-        return top_brands_summary(dataframe, extract_requested_limit(prompt))
+    platform_totals = (
+        dataframe.groupby("platform", as_index=False)
+        .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"), anomalies=("is_anomalous", "sum"))
+        .sort_values("revenue", ascending=False)
+    )
+    lines = [
+        f"{idx}. **{row['platform']}** - {format_in_inr(row['revenue'])}, {int(row['units']):,} units, {int(row['anomalies'])} anomalies"
+        for idx, row in enumerate(platform_totals.to_dict("records"), start=1)
+    ]
+    return "BrandBot Analysis: Revenue by platform:\n\n" + "\n".join(lines)
+
+
+def region_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to summarize regions."
+
+    region_totals = (
+        dataframe.groupby("region", as_index=False)
+        .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"), brands=("brand_id", "nunique"))
+        .sort_values("revenue", ascending=False)
+    )
+    lines = [
+        f"{idx}. **{row['region']}** - {format_in_inr(row['revenue'])}, {int(row['units']):,} units, {int(row['brands'])} brands"
+        for idx, row in enumerate(region_totals.to_dict("records"), start=1)
+    ]
+    return "BrandBot Analysis: Regional performance:\n\n" + "\n".join(lines)
+
+
+def brand_detail_summary(dataframe, brand_name):
+    brand_df = dataframe[dataframe["name"] == brand_name]
+    if brand_df.empty:
+        return f"BrandBot Analysis: I could not find sales data for **{brand_name}**."
+
+    row = brand_df.iloc[0]
+    revenue = brand_df["revenue"].sum()
+    units = int(brand_df["units_sold"].sum())
+    anomalies = int(brand_df["is_anomalous"].sum())
+    avg_return_rate = brand_df["return_rate"].mean() * 100
+    top_platform = brand_df.groupby("platform")["revenue"].sum().sort_values(ascending=False).index[0]
+
+    return (
+        f"BrandBot Analysis: **{brand_name}** is a **{row['category']}** brand in **{row['region']}**. "
+        f"It has **{format_in_inr(revenue)}** revenue, **{units:,}** units sold, "
+        f"**{anomalies}** anomalous records, and an average return rate of **{avg_return_rate:.1f}%**. "
+        f"Top platform by revenue: **{top_platform}**."
+    )
+
+
+def compare_brands_summary(dataframe, brands):
+    rows = []
+    for brand in brands[:4]:
+        brand_df = dataframe[dataframe["name"] == brand]
+        if brand_df.empty:
+            continue
+        rows.append({
+            "name": brand,
+            "revenue": brand_df["revenue"].sum(),
+            "units": int(brand_df["units_sold"].sum()),
+            "anomalies": int(brand_df["is_anomalous"].sum()),
+            "return_rate": brand_df["return_rate"].mean() * 100,
+        })
+
+    if len(rows) < 2:
+        return "BrandBot Analysis: Please mention at least two known brand names to compare."
+
+    rows = sorted(rows, key=lambda row: row["revenue"], reverse=True)
+    lines = [
+        f"{idx}. **{row['name']}** - {format_in_inr(row['revenue'])}, {row['units']:,} units, {row['anomalies']} anomalies, {row['return_rate']:.1f}% avg return rate"
+        for idx, row in enumerate(rows, start=1)
+    ]
+    return "BrandBot Analysis: Brand comparison:\n\n" + "\n".join(lines)
+
+
+def trend_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to summarize trends."
+
+    monthly = (
+        dataframe.groupby(dataframe["date"].dt.to_period("M"))
+        .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"))
+        .reset_index()
+        .sort_values("revenue", ascending=False)
+    )
+    best = monthly.iloc[0]
+    latest = monthly.sort_values("date").iloc[-1]
+    return (
+        "BrandBot Analysis: "
+        f"Best revenue month was **{best['date']}** with **{format_in_inr(best['revenue'])}**. "
+        f"Latest month in the data is **{latest['date']}** with **{format_in_inr(latest['revenue'])}** "
+        f"and **{int(latest['units']):,}** units."
+    )
+
+
+def list_brands_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any brands loaded."
+
+    brands = sorted(dataframe["name"].dropna().unique())
+    return "BrandBot Analysis: Available brands are:\n\n" + ", ".join(f"**{brand}**" for brand in brands)
+
+
+def answer_brandbot(prompt, dataframe):
+    prompt_lower = clean_prompt(prompt)
+    mentioned_brands = find_brand_mentions(prompt, dataframe)
+
+    if any(phrase in prompt_lower for phrase in ["how can i use", "what can you do", "help", "examples", "guide"]):
+        return help_summary()
+
+    if len(mentioned_brands) >= 2 and any(word in prompt_lower for word in ["compare", "versus", "vs", "difference"]):
+        return compare_brands_summary(dataframe, mentioned_brands)
+
+    if len(mentioned_brands) == 1 and any(word in prompt_lower for word in ["about", "tell", "detail", "performance", "summary", "revenue", "sales", "anomaly"]):
+        return brand_detail_summary(dataframe, mentioned_brands[0])
+
+    if "category" in prompt_lower and any(word in prompt_lower for word in ["top", "best", "highest", "leader", "rank"]):
+        return top_brands_by_category_summary(dataframe, extract_requested_limit(prompt, default=1))
+
+    if "category" in prompt_lower:
+        return category_summary(dataframe)
 
     if any(word in prompt_lower for word in ["anomaly", "anomalies", "outlier", "return"]):
         return anomaly_summary(dataframe)
+
+    if "platform" in prompt_lower or "channel" in prompt_lower:
+        return platform_summary(dataframe)
+
+    if "region" in prompt_lower or "regional" in prompt_lower:
+        return region_summary(dataframe)
+
+    if any(word in prompt_lower for word in ["trend", "month", "monthly", "time"]):
+        return trend_summary(dataframe)
+
+    if "list" in prompt_lower and "brand" in prompt_lower and not any(word in prompt_lower for word in ["top", "best", "highest"]):
+        return list_brands_summary(dataframe)
+
+    if any(word in prompt_lower for word in ["lowest", "worst", "least"]):
+        return top_brands_summary(dataframe, extract_requested_limit(prompt), ascending=True)
+
+    if any(word in prompt_lower for word in ["top", "best", "highest", "rank", "leader"]):
+        return top_brands_summary(dataframe, extract_requested_limit(prompt))
 
     if any(word in prompt_lower for word in ["revenue", "sales", "units", "total"]):
         return revenue_summary(dataframe)
 
     return (
-        "BrandBot Analysis: I answer only from the loaded BrandPulse sales data. "
-        "Try asking **@bot list top 3 brands**, **@bot show anomalies**, or "
-        "**@bot total revenue**."
+        "BrandBot Analysis: I answer questions from the loaded BrandPulse sales data. "
+        "Try **list top 3 brands**, **top brands in each category**, **show anomalies**, "
+        "**revenue by platform**, or **how can I use you?**"
     )
 
 
@@ -400,14 +609,14 @@ elif app_mode == "AI Intelligence Chat":
     # Simple simulated conversation state
     if "messages" not in st.session_state:
         st.session_state.messages = [
-            {"role": "assistant", "content": "Welcome to the BrandPulse Intelligence Feed. I am BrandBot. Ask me about our top brands or anomalies!"}
+            {"role": "assistant", "content": "Welcome to the BrandPulse Intelligence Feed. I am BrandBot. Ask me about brands, categories, revenue, platforms, regions, trends, or anomalies."}
         ]
         
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
             
-    if prompt := st.chat_input("Type something... e.g. '@bot list top 3 brands'"):
+    if prompt := st.chat_input("Ask about BrandPulse data... e.g. 'top brands in each category'"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
