@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import sqlite3
 import os
+import re
 from datetime import datetime, date, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
@@ -54,6 +55,110 @@ def format_in_inr(v):
         return f"₹{v / 100000:.2f} L"
     else:
         return f"₹{v:,.2f}"
+
+# Dashboard and chatbot helpers
+def normalize_date_range(date_range, min_date, max_date):
+    if isinstance(date_range, (tuple, list)):
+        if len(date_range) >= 2:
+            start_date, end_date = date_range[0], date_range[1]
+        elif len(date_range) == 1:
+            start_date = end_date = date_range[0]
+        else:
+            start_date, end_date = min_date, max_date
+    else:
+        start_date = end_date = date_range
+
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    return start_date, end_date
+
+
+def extract_requested_limit(prompt, default=3, maximum=10):
+    match = re.search(r"\btop\s+(\d+)\b|\b(\d+)\s+brands?\b", prompt.lower())
+    if not match:
+        return default
+
+    requested = int(next(group for group in match.groups() if group))
+    return max(1, min(requested, maximum))
+
+
+def top_brands_summary(dataframe, limit):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to rank brands."
+
+    top_brands = (
+        dataframe.groupby("name", as_index=False)
+        .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"))
+        .sort_values(by="revenue", ascending=False)
+        .head(limit)
+    )
+
+    lines = [
+        f"{idx}. **{row['name']}** - {format_in_inr(row['revenue'])} revenue, {int(row['units']):,} units"
+        for idx, row in enumerate(top_brands.to_dict("records"), start=1)
+    ]
+    return "BrandBot Analysis: Top brands by revenue:\n\n" + "\n".join(lines)
+
+
+def anomaly_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to analyze anomalies."
+
+    anomalous_df = dataframe[dataframe["is_anomalous"] == 1]
+    total_anomalies = int(anomalous_df.shape[0])
+    if total_anomalies == 0:
+        return "BrandBot Analysis: No sales anomalies are currently flagged in the loaded data."
+
+    platform_counts = anomalous_df["platform"].value_counts()
+    top_platform = platform_counts.index[0]
+    top_platform_count = int(platform_counts.iloc[0])
+    brand_counts = anomalous_df["name"].value_counts()
+    top_brand = brand_counts.index[0]
+    top_brand_count = int(brand_counts.iloc[0])
+
+    return (
+        "BrandBot Analysis: "
+        f"Detected **{total_anomalies}** anomalous sales records. "
+        f"Highest anomaly platform: **{top_platform}** ({top_platform_count} records). "
+        f"Most affected brand: **{top_brand}** ({top_brand_count} records)."
+    )
+
+
+def revenue_summary(dataframe):
+    if dataframe.empty:
+        return "BrandBot Analysis: I do not have any sales rows loaded to summarize revenue."
+
+    total_revenue = dataframe["revenue"].sum()
+    total_units = int(dataframe["units_sold"].sum())
+    active_brands = dataframe["brand_id"].nunique()
+    return (
+        "BrandBot Analysis: "
+        f"Total revenue is **{format_in_inr(total_revenue)}** across "
+        f"**{total_units:,}** units and **{active_brands}** active brands."
+    )
+
+
+def answer_brandbot(prompt, dataframe):
+    prompt_lower = prompt.lower()
+    if "@bot" not in prompt_lower and "bot" not in prompt_lower:
+        return "For AI assistant feedback, please prepend your prompt with **@bot**."
+
+    if any(word in prompt_lower for word in ["top", "best", "highest", "rank", "leader"]):
+        return top_brands_summary(dataframe, extract_requested_limit(prompt))
+
+    if any(word in prompt_lower for word in ["anomaly", "anomalies", "outlier", "return"]):
+        return anomaly_summary(dataframe)
+
+    if any(word in prompt_lower for word in ["revenue", "sales", "units", "total"]):
+        return revenue_summary(dataframe)
+
+    return (
+        "BrandBot Analysis: I answer only from the loaded BrandPulse sales data. "
+        "Try asking **@bot list top 3 brands**, **@bot show anomalies**, or "
+        "**@bot total revenue**."
+    )
+
 
 # Helper function to get database connection
 def get_db_data():
@@ -162,7 +267,13 @@ if app_mode == "Dashboard":
     # Date Filter
     min_date = sales_df['date'].min().date()
     max_date = sales_df['date'].max().date()
-    start_date, end_date = st.sidebar.date_input("Date Range", [min_date, max_date])
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    start_date, end_date = normalize_date_range(date_range, min_date, max_date)
     
     # Apply filters
     filtered_df = merged_df[
@@ -197,64 +308,67 @@ if app_mode == "Dashboard":
         st.metric("Anomalies", f"{anomalies_count}")
         st.markdown('</div>', unsafe_allow_html=True)
         
-    # Main Trend Chart
-    st.subheader("Revenue Trend Over Time")
-    trend_df = filtered_df.groupby(filtered_df['date'].dt.to_period('M')).agg({'revenue': 'sum'}).reset_index()
-    trend_df['date'] = trend_df['date'].dt.to_timestamp()
-    
-    fig_trend = px.area(
-        trend_df, x="date", y="revenue",
-        color_discrete_sequence=["#6366F1"],
-        template="plotly_dark"
-    )
-    fig_trend.update_layout(
-        plot_bgcolor="#12141A",
-        paper_bgcolor="#0A0B0F",
-        margin=dict(l=20, r=20, t=10, b=10),
-        height=320,
-        xaxis_title=None,
-        yaxis_title=None
-    )
-    st.plotly_chart(fig_trend, use_container_width=True)
-    
-    # Columns for secondary charts
-    col_left, col_right = st.columns([1.5, 1])
-    
-    with col_left:
-        st.subheader("Top Brands by Revenue")
-        top_b_df = filtered_df.groupby("name").agg({"revenue": "sum"}).reset_index().sort_values(by="revenue", ascending=False).head(5)
-        # Use simple string representation for color scale to avoid Plotly version discrepancies
-        fig_bar = px.bar(
-            top_b_df, x="revenue", y="name", orientation="h",
-            color="revenue", color_continuous_scale="Purples",
-            template="plotly_dark"
-        )
-        fig_bar.update_layout(
-            plot_bgcolor="#12141A",
-            paper_bgcolor="#0A0B0F",
-            margin=dict(l=20, r=20, t=10, b=10),
-            height=280,
-            xaxis_title=None,
-            yaxis_title=None,
-            coloraxis_showscale=False
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+    if filtered_df.empty:
+        st.warning("No sales data matches the selected brand and date range.")
+    else:
+        # Main Trend Chart
+        st.subheader("Revenue Trend Over Time")
+        trend_df = filtered_df.groupby(filtered_df['date'].dt.to_period('M')).agg({'revenue': 'sum'}).reset_index()
+        trend_df['date'] = trend_df['date'].dt.to_timestamp()
         
-    with col_right:
-        st.subheader("Platform Revenue Split")
-        plat_df = filtered_df.groupby("platform").agg({"revenue": "sum"}).reset_index()
-        fig_pie = px.pie(
-            plat_df, values="revenue", names="platform", hole=0.5,
-            color_discrete_sequence=["#6366F1", "#F59E0B", "#10B981"],
+        fig_trend = px.area(
+            trend_df, x="date", y="revenue",
+            color_discrete_sequence=["#6366F1"],
             template="plotly_dark"
         )
-        fig_pie.update_layout(
+        fig_trend.update_layout(
             plot_bgcolor="#12141A",
             paper_bgcolor="#0A0B0F",
             margin=dict(l=20, r=20, t=10, b=10),
-            height=280
+            height=320,
+            xaxis_title=None,
+            yaxis_title=None
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_trend, use_container_width=True)
+        
+        # Columns for secondary charts
+        col_left, col_right = st.columns([1.5, 1])
+        
+        with col_left:
+            st.subheader("Top Brands by Revenue")
+            top_b_df = filtered_df.groupby("name").agg({"revenue": "sum"}).reset_index().sort_values(by="revenue", ascending=False).head(5)
+            # Use simple string representation for color scale to avoid Plotly version discrepancies
+            fig_bar = px.bar(
+                top_b_df, x="revenue", y="name", orientation="h",
+                color="revenue", color_continuous_scale="Purples",
+                template="plotly_dark"
+            )
+            fig_bar.update_layout(
+                plot_bgcolor="#12141A",
+                paper_bgcolor="#0A0B0F",
+                margin=dict(l=20, r=20, t=10, b=10),
+                height=280,
+                xaxis_title=None,
+                yaxis_title=None,
+                coloraxis_showscale=False
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+        with col_right:
+            st.subheader("Platform Revenue Split")
+            plat_df = filtered_df.groupby("platform").agg({"revenue": "sum"}).reset_index()
+            fig_pie = px.pie(
+                plat_df, values="revenue", names="platform", hole=0.5,
+                color_discrete_sequence=["#6366F1", "#F59E0B", "#10B981"],
+                template="plotly_dark"
+            )
+            fig_pie.update_layout(
+                plot_bgcolor="#12141A",
+                paper_bgcolor="#0A0B0F",
+                margin=dict(l=20, r=20, t=10, b=10),
+                height=280
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
 
     # ETL Log Status Table
     st.subheader("Pipeline status logs")
@@ -298,20 +412,7 @@ elif app_mode == "AI Intelligence Chat":
         with st.chat_message("user"):
             st.write(prompt)
             
-        # Standard responses mimicking logic
-        response = ""
-        prompt_lower = prompt.lower()
-        if "@bot" in prompt_lower or "bot" in prompt_lower:
-            if "top" in prompt_lower or "best" in prompt_lower or "highest" in prompt_lower:
-                top_b = merged_df.groupby("name").agg({"revenue": "sum"}).reset_index().sort_values(by="revenue", ascending=False).iloc[0]
-                response = f"BrandBot Analysis: Our top performing brand is **{top_b['name']}** with total revenue of **{format_in_inr(top_b['revenue'])}**. Let me know if you want a detailed region breakdown!"
-            elif "anomaly" in prompt_lower or "anomalies" in prompt_lower or "outlier" in prompt_lower:
-                total_anomalies = merged_df["is_anomalous"].sum()
-                response = f"BrandBot Analysis: We have detected a total of **{total_anomalies} sales anomalies** (returns > 30%). Flipkart accounts for the highest share of these anomalies. We should review category pricing."
-            else:
-                response = "BrandBot Analysis: I can help you analyze revenue trends, identify anomalies, and rank top performing brands. Try asking: '@bot what are the total anomalies?' or '@bot who is the top brand?'"
-        else:
-            response = "For AI assistant feedback, please prepend your prompt with **@bot**."
+        response = answer_brandbot(prompt, merged_df)
             
         st.session_state.messages.append({"role": "assistant", "content": response})
         with st.chat_message("assistant"):
