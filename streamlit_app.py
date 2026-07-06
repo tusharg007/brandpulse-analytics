@@ -93,20 +93,124 @@ def find_brand_mentions(prompt, dataframe):
     return [brand for brand in brand_names if brand.lower() in prompt_lower]
 
 
+def normalize_lookup_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def available_values(dataframe, column):
+    return sorted(str(value) for value in dataframe[column].dropna().unique())
+
+
+def format_available_values(values):
+    return ", ".join(f"**{value}**" for value in values)
+
+
+def find_value_mentions(prompt, values, aliases=None):
+    prompt_text = f" {normalize_lookup_text(prompt)} "
+    aliases = aliases or {}
+    matches = []
+
+    for value in values:
+        terms = [value] + aliases.get(value.lower(), [])
+        for term in terms:
+            term_text = f" {normalize_lookup_text(term)} "
+            if term_text in prompt_text:
+                matches.append(value)
+                break
+
+    return matches
+
+
+def category_aliases(dataframe):
+    aliases = {
+        "fashion": ["apparel", "clothing", "clothes", "wear"],
+        "footwear": ["shoe", "shoes", "sneaker", "sneakers"],
+        "lifestyle": ["home", "living", "decor"],
+    }
+    available_categories = {category.lower() for category in available_values(dataframe, "category")}
+    return {category: terms for category, terms in aliases.items() if category in available_categories}
+
+
+def filter_by_values(dataframe, column, values):
+    if not values:
+        return dataframe
+    return dataframe[dataframe[column].isin(values)]
+
+
+def unsupported_slice_message(kind, requested, available):
+    if kind == "filter":
+        categories, platforms, regions = available
+        return (
+            f"BrandBot Analysis: I do not have a BrandPulse data slice for **{requested}**. "
+            f"Available categories: {format_available_values(categories)}. "
+            f"Available platforms: {format_available_values(platforms)}. "
+            f"Available regions: {format_available_values(regions)}."
+        )
+
+    return (
+        f"BrandBot Analysis: I do not have data for **{requested}** as a {kind}. "
+        f"Available {kind}s are: {format_available_values(available)}."
+    )
+
+
+def extract_requested_slice(prompt, dataframe):
+    prompt_lower = clean_prompt(prompt)
+    categories = available_values(dataframe, "category")
+    platforms = available_values(dataframe, "platform")
+    regions = available_values(dataframe, "region")
+
+    category_matches = find_value_mentions(prompt_lower, categories, category_aliases(dataframe))
+    platform_matches = find_value_mentions(prompt_lower, platforms)
+    region_matches = find_value_mentions(prompt_lower, regions)
+
+    if category_matches:
+        return "category", category_matches[0], filter_by_values(dataframe, "category", category_matches)
+    if platform_matches:
+        return "platform", platform_matches[0], filter_by_values(dataframe, "platform", platform_matches)
+    if region_matches:
+        return "region", region_matches[0], filter_by_values(dataframe, "region", region_matches)
+
+    if "food" in prompt_lower or "beverage" in prompt_lower:
+        return "unsupported_filter", "food and beverages", dataframe.iloc[0:0]
+
+    slice_query_match = re.search(
+        r"\b(?:top|best|highest|lowest|worst|least|rank|revenue|sales|units|anomaly|anomalies|trend)\b.*\b(?:in|for|from)\s+(.+)$",
+        prompt_lower,
+    )
+    if slice_query_match:
+        requested = slice_query_match.group(1).strip(" ?.!:")
+        ignored_phrases = ["each category", "all categories", "revenue", "sales", "units"]
+        if requested and not any(phrase in requested for phrase in ignored_phrases):
+            return "unsupported_filter", requested, dataframe.iloc[0:0]
+
+    return None, None, dataframe
+
+
+def slice_label(kind, value):
+    if kind == "category":
+        return f"category **{value}**"
+    if kind == "platform":
+        return f"platform **{value}**"
+    if kind == "region":
+        return f"region **{value}**"
+    return None
+
+
 def help_summary():
     return (
         "BrandBot Analysis: You can ask me direct questions about the loaded BrandPulse data. "
         "For example:\n\n"
         "1. **Top brands** - `list top 3 brands`\n"
-        "2. **Category leaders** - `top brands in each category`\n"
-        "3. **Anomalies** - `show anomalies by platform`\n"
-        "4. **Revenue** - `total revenue` or `revenue by platform`\n"
-        "5. **Brand details** - `tell me about SoleStrike`\n"
-        "6. **Compare brands** - `compare SoleStrike and TrailBlaze`"
+        "2. **Filtered rankings** - `top brands in footwear` or `top brands in West India`\n"
+        "3. **Category leaders** - `top brands in each category`\n"
+        "4. **Anomalies** - `show anomalies by platform`\n"
+        "5. **Revenue** - `total revenue` or `revenue by platform`\n"
+        "6. **Brand details** - `tell me about SoleStrike`\n"
+        "7. **Compare brands** - `compare SoleStrike and TrailBlaze`"
     )
 
 
-def top_brands_summary(dataframe, limit, ascending=False):
+def top_brands_summary(dataframe, limit, ascending=False, scope_label=None):
     if dataframe.empty:
         return "BrandBot Analysis: I do not have any sales rows loaded to rank brands."
 
@@ -122,6 +226,8 @@ def top_brands_summary(dataframe, limit, ascending=False):
         for idx, row in enumerate(top_brands.to_dict("records"), start=1)
     ]
     label = "Lowest brands by revenue" if ascending else "Top brands by revenue"
+    if scope_label:
+        label = f"{label} for {scope_label}"
     return f"BrandBot Analysis: {label}:\n\n" + "\n".join(lines)
 
 
@@ -163,7 +269,7 @@ def category_summary(dataframe):
     return "BrandBot Analysis: Category performance:\n\n" + "\n".join(lines)
 
 
-def anomaly_summary(dataframe):
+def anomaly_summary(dataframe, scope_label=None):
     if dataframe.empty:
         return "BrandBot Analysis: I do not have any sales rows loaded to analyze anomalies."
 
@@ -188,8 +294,9 @@ def anomaly_summary(dataframe):
         for idx, (platform, count) in enumerate(platform_counts.head(3).items(), start=1)
     ]
 
+    scope_text = f" for {scope_label}" if scope_label else ""
     return (
-        "BrandBot Analysis: "
+        f"BrandBot Analysis: Anomalies{scope_text}. "
         f"Detected **{total_anomalies}** anomalous sales records. "
         f"Highest anomaly platform: **{top_platform}** ({top_platform_count} records). "
         f"Most affected brand: **{top_brand}** ({top_brand_count} records).\n\n"
@@ -200,16 +307,17 @@ def anomaly_summary(dataframe):
     )
 
 
-def revenue_summary(dataframe):
+def revenue_summary(dataframe, scope_label=None):
     if dataframe.empty:
         return "BrandBot Analysis: I do not have any sales rows loaded to summarize revenue."
 
     total_revenue = dataframe["revenue"].sum()
     total_units = int(dataframe["units_sold"].sum())
     active_brands = dataframe["brand_id"].nunique()
+    scope_text = f" for {scope_label}" if scope_label else ""
     return (
         "BrandBot Analysis: "
-        f"Total revenue is **{format_in_inr(total_revenue)}** across "
+        f"Total revenue{scope_text} is **{format_in_inr(total_revenue)}** across "
         f"**{total_units:,}** units and **{active_brands}** active brands."
     )
 
@@ -266,6 +374,13 @@ def brand_detail_summary(dataframe, brand_name):
     )
 
 
+def unknown_brand_message(dataframe):
+    return (
+        "BrandBot Analysis: I could not match that to a known BrandPulse brand. "
+        f"Available brands are: {format_available_values(available_values(dataframe, 'name'))}."
+    )
+
+
 def compare_brands_summary(dataframe, brands):
     rows = []
     for brand in brands[:4]:
@@ -291,7 +406,7 @@ def compare_brands_summary(dataframe, brands):
     return "BrandBot Analysis: Brand comparison:\n\n" + "\n".join(lines)
 
 
-def trend_summary(dataframe):
+def trend_summary(dataframe, scope_label=None):
     if dataframe.empty:
         return "BrandBot Analysis: I do not have any sales rows loaded to summarize trends."
 
@@ -303,9 +418,10 @@ def trend_summary(dataframe):
     )
     best = monthly.iloc[0]
     latest = monthly.sort_values("date").iloc[-1]
+    scope_text = f" for {scope_label}" if scope_label else ""
     return (
         "BrandBot Analysis: "
-        f"Best revenue month was **{best['date']}** with **{format_in_inr(best['revenue'])}**. "
+        f"Best revenue month{scope_text} was **{best['date']}** with **{format_in_inr(best['revenue'])}**. "
         f"Latest month in the data is **{latest['date']}** with **{format_in_inr(latest['revenue'])}** "
         f"and **{int(latest['units']):,}** units."
     )
@@ -322,6 +438,20 @@ def list_brands_summary(dataframe):
 def answer_brandbot(prompt, dataframe):
     prompt_lower = clean_prompt(prompt)
     mentioned_brands = find_brand_mentions(prompt, dataframe)
+    slice_kind, slice_value, scoped_df = extract_requested_slice(prompt, dataframe)
+
+    if slice_kind == "unsupported_filter":
+        return unsupported_slice_message(
+            "filter",
+            slice_value,
+            (
+                available_values(dataframe, "category"),
+                available_values(dataframe, "platform"),
+                available_values(dataframe, "region"),
+            ),
+        )
+
+    scoped_label = slice_label(slice_kind, slice_value)
 
     if any(phrase in prompt_lower for phrase in ["how can i use", "what can you do", "help", "examples", "guide"]):
         return help_summary()
@@ -329,17 +459,36 @@ def answer_brandbot(prompt, dataframe):
     if len(mentioned_brands) >= 2 and any(word in prompt_lower for word in ["compare", "versus", "vs", "difference"]):
         return compare_brands_summary(dataframe, mentioned_brands)
 
+    if any(word in prompt_lower for word in ["compare", "versus", "vs", "difference"]) and len(mentioned_brands) < 2:
+        return "BrandBot Analysis: Please mention two known BrandPulse brands to compare."
+
     if len(mentioned_brands) == 1 and any(word in prompt_lower for word in ["about", "tell", "detail", "performance", "summary", "revenue", "sales", "anomaly"]):
         return brand_detail_summary(dataframe, mentioned_brands[0])
 
-    if "category" in prompt_lower and any(word in prompt_lower for word in ["top", "best", "highest", "leader", "rank"]):
+    analytics_terms = [
+        "category", "revenue", "sales", "unit", "anomaly", "anomalies", "outlier",
+        "return", "platform", "region", "trend", "top", "best", "highest"
+    ]
+    if any(word in prompt_lower for word in ["about", "tell", "detail"]) and not any(term in prompt_lower for term in analytics_terms):
+        return unknown_brand_message(dataframe)
+
+    if (
+        any(phrase in prompt_lower for phrase in ["each category", "all categories", "by category", "category wise", "category-wise"])
+        and any(word in prompt_lower for word in ["top", "best", "highest", "leader", "rank"])
+    ):
         return top_brands_by_category_summary(dataframe, extract_requested_limit(prompt, default=1))
+
+    if scoped_label and any(word in prompt_lower for word in ["lowest", "worst", "least"]):
+        return top_brands_summary(scoped_df, extract_requested_limit(prompt), ascending=True, scope_label=scoped_label)
+
+    if scoped_label and any(word in prompt_lower for word in ["top", "best", "highest", "rank", "leader"]):
+        return top_brands_summary(scoped_df, extract_requested_limit(prompt), scope_label=scoped_label)
 
     if "category" in prompt_lower:
         return category_summary(dataframe)
 
     if any(word in prompt_lower for word in ["anomaly", "anomalies", "outlier", "return"]):
-        return anomaly_summary(dataframe)
+        return anomaly_summary(scoped_df if scoped_label else dataframe, scoped_label)
 
     if "platform" in prompt_lower or "channel" in prompt_lower:
         return platform_summary(dataframe)
@@ -348,7 +497,7 @@ def answer_brandbot(prompt, dataframe):
         return region_summary(dataframe)
 
     if any(word in prompt_lower for word in ["trend", "month", "monthly", "time"]):
-        return trend_summary(dataframe)
+        return trend_summary(scoped_df if scoped_label else dataframe, scoped_label)
 
     if "list" in prompt_lower and "brand" in prompt_lower and not any(word in prompt_lower for word in ["top", "best", "highest"]):
         return list_brands_summary(dataframe)
@@ -360,7 +509,7 @@ def answer_brandbot(prompt, dataframe):
         return top_brands_summary(dataframe, extract_requested_limit(prompt))
 
     if any(word in prompt_lower for word in ["revenue", "sales", "units", "total"]):
-        return revenue_summary(dataframe)
+        return revenue_summary(scoped_df if scoped_label else dataframe, scoped_label)
 
     return (
         "BrandBot Analysis: I answer questions from the loaded BrandPulse sales data. "
