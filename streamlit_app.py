@@ -83,6 +83,15 @@ def extract_requested_limit(prompt, default=3, maximum=10):
     return max(1, min(requested, maximum))
 
 
+RANKING_WORDS = ["top", "best", "highest", "rank", "leader"]
+LOWEST_RANKING_WORDS = ["lowest", "worst", "least"]
+ANALYTICS_TERMS = [
+    "category", "revenue", "sales", "unit", "anomaly", "anomalies", "outlier",
+    "return", "platform", "region", "trend", "top", "best", "highest", "lowest",
+    "worst", "least", "rank", "leader"
+]
+
+
 def clean_prompt(prompt):
     return prompt.lower().replace("@bot", " ").replace("@", " ").strip()
 
@@ -196,6 +205,85 @@ def slice_label(kind, value):
     return None
 
 
+def has_any_word(prompt_lower, words):
+    return any(word in prompt_lower for word in words)
+
+
+def is_ranking_prompt(prompt_lower):
+    return has_any_word(prompt_lower, RANKING_WORDS + LOWEST_RANKING_WORDS)
+
+
+def is_each_category_prompt(prompt_lower):
+    return any(phrase in prompt_lower for phrase in ["each category", "all categories", "by category", "category wise", "category-wise"])
+
+
+def infer_prompt_intent(prompt, dataframe):
+    prompt_lower = clean_prompt(prompt)
+    slice_kind, slice_value, _ = extract_requested_slice(prompt, dataframe)
+    if slice_kind == "unsupported_filter":
+        return None
+
+    if is_each_category_prompt(prompt_lower) and has_any_word(prompt_lower, RANKING_WORDS):
+        return {"type": "top_by_category", "limit": extract_requested_limit(prompt, default=1)}
+    if has_any_word(prompt_lower, LOWEST_RANKING_WORDS):
+        return {"type": "lowest_brands", "limit": extract_requested_limit(prompt), "slice_kind": slice_kind, "slice_value": slice_value}
+    if has_any_word(prompt_lower, RANKING_WORDS):
+        return {"type": "top_brands", "limit": extract_requested_limit(prompt), "slice_kind": slice_kind, "slice_value": slice_value}
+    if has_any_word(prompt_lower, ["anomaly", "anomalies", "outlier", "return"]):
+        return {"type": "anomalies", "slice_kind": slice_kind, "slice_value": slice_value}
+    if has_any_word(prompt_lower, ["trend", "month", "monthly", "time"]):
+        return {"type": "trend", "slice_kind": slice_kind, "slice_value": slice_value}
+    if has_any_word(prompt_lower, ["revenue", "sales", "units", "total"]):
+        return {"type": "revenue", "slice_kind": slice_kind, "slice_value": slice_value}
+
+    return None
+
+
+def is_followup_prompt(prompt):
+    prompt_lower = clean_prompt(prompt)
+    return (
+        prompt_lower.startswith(("and ", "also ", "what about ", "how about ", "for "))
+        or bool(re.fullmatch(r"(?:and\s+)?(?:for\s+)?[a-z ]+\??", prompt_lower))
+    )
+
+
+def prompt_has_explicit_intent(prompt):
+    prompt_lower = clean_prompt(prompt)
+    return (
+        is_ranking_prompt(prompt_lower)
+        or has_any_word(prompt_lower, ["anomaly", "anomalies", "outlier", "return"])
+        or has_any_word(prompt_lower, ["trend", "month", "monthly", "time"])
+        or has_any_word(prompt_lower, ["revenue", "sales", "units", "total"])
+        or any(phrase in prompt_lower for phrase in ["how can i use", "what can you do", "help", "examples", "guide"])
+    )
+
+
+def resolve_followup_prompt(prompt, previous_context, dataframe):
+    if not previous_context or prompt_has_explicit_intent(prompt) or not is_followup_prompt(prompt):
+        return prompt
+
+    slice_kind, slice_value, _ = extract_requested_slice(prompt, dataframe)
+    if not slice_kind or slice_kind == "unsupported_filter":
+        return prompt
+
+    target = slice_value
+    context_type = previous_context.get("type")
+    limit = previous_context.get("limit", 3)
+
+    if context_type == "top_brands":
+        return f"top {limit} brands in {target}"
+    if context_type == "lowest_brands":
+        return f"lowest {limit} brands in {target}"
+    if context_type == "anomalies":
+        return f"anomalies in {target}"
+    if context_type == "trend":
+        return f"trend in {target}"
+    if context_type == "revenue":
+        return f"revenue in {target}"
+
+    return prompt
+
+
 def help_summary():
     return (
         "BrandBot Analysis: You can ask me direct questions about the loaded BrandPulse data. "
@@ -214,12 +302,12 @@ def top_brands_summary(dataframe, limit, ascending=False, scope_label=None):
     if dataframe.empty:
         return "BrandBot Analysis: I do not have any sales rows loaded to rank brands."
 
-    top_brands = (
+    ranked_brands = (
         dataframe.groupby("name", as_index=False)
         .agg(revenue=("revenue", "sum"), units=("units_sold", "sum"))
         .sort_values(by="revenue", ascending=ascending)
-        .head(limit)
     )
+    top_brands = ranked_brands.head(limit)
 
     lines = [
         f"{idx}. **{row['name']}** - {format_in_inr(row['revenue'])} revenue, {int(row['units']):,} units"
@@ -228,7 +316,14 @@ def top_brands_summary(dataframe, limit, ascending=False, scope_label=None):
     label = "Lowest brands by revenue" if ascending else "Top brands by revenue"
     if scope_label:
         label = f"{label} for {scope_label}"
-    return f"BrandBot Analysis: {label}:\n\n" + "\n".join(lines)
+
+    note = ""
+    available_count = len(ranked_brands)
+    if limit > available_count:
+        plural = "brand is" if available_count == 1 else "brands are"
+        note = f"\n\nOnly **{available_count}** matching {plural} available, so I am showing all of them."
+
+    return f"BrandBot Analysis: {label}:\n\n" + "\n".join(lines) + note
 
 
 def top_brands_by_category_summary(dataframe, limit):
@@ -435,10 +530,11 @@ def list_brands_summary(dataframe):
     return "BrandBot Analysis: Available brands are:\n\n" + ", ".join(f"**{brand}**" for brand in brands)
 
 
-def answer_brandbot(prompt, dataframe):
-    prompt_lower = clean_prompt(prompt)
+def answer_brandbot(prompt, dataframe, previous_context=None):
+    resolved_prompt = resolve_followup_prompt(prompt, previous_context, dataframe)
+    prompt_lower = clean_prompt(resolved_prompt)
     mentioned_brands = find_brand_mentions(prompt, dataframe)
-    slice_kind, slice_value, scoped_df = extract_requested_slice(prompt, dataframe)
+    slice_kind, slice_value, scoped_df = extract_requested_slice(resolved_prompt, dataframe)
 
     if slice_kind == "unsupported_filter":
         return unsupported_slice_message(
@@ -465,24 +561,20 @@ def answer_brandbot(prompt, dataframe):
     if len(mentioned_brands) == 1 and any(word in prompt_lower for word in ["about", "tell", "detail", "performance", "summary", "revenue", "sales", "anomaly"]):
         return brand_detail_summary(dataframe, mentioned_brands[0])
 
-    analytics_terms = [
-        "category", "revenue", "sales", "unit", "anomaly", "anomalies", "outlier",
-        "return", "platform", "region", "trend", "top", "best", "highest"
-    ]
-    if any(word in prompt_lower for word in ["about", "tell", "detail"]) and not any(term in prompt_lower for term in analytics_terms):
+    if any(word in prompt_lower for word in ["about", "tell", "detail"]) and not any(term in prompt_lower for term in ANALYTICS_TERMS):
         return unknown_brand_message(dataframe)
 
     if (
-        any(phrase in prompt_lower for phrase in ["each category", "all categories", "by category", "category wise", "category-wise"])
-        and any(word in prompt_lower for word in ["top", "best", "highest", "leader", "rank"])
+        is_each_category_prompt(prompt_lower)
+        and has_any_word(prompt_lower, RANKING_WORDS)
     ):
-        return top_brands_by_category_summary(dataframe, extract_requested_limit(prompt, default=1))
+        return top_brands_by_category_summary(dataframe, extract_requested_limit(resolved_prompt, default=1))
 
-    if scoped_label and any(word in prompt_lower for word in ["lowest", "worst", "least"]):
-        return top_brands_summary(scoped_df, extract_requested_limit(prompt), ascending=True, scope_label=scoped_label)
+    if scoped_label and has_any_word(prompt_lower, LOWEST_RANKING_WORDS):
+        return top_brands_summary(scoped_df, extract_requested_limit(resolved_prompt), ascending=True, scope_label=scoped_label)
 
-    if scoped_label and any(word in prompt_lower for word in ["top", "best", "highest", "rank", "leader"]):
-        return top_brands_summary(scoped_df, extract_requested_limit(prompt), scope_label=scoped_label)
+    if scoped_label and has_any_word(prompt_lower, RANKING_WORDS):
+        return top_brands_summary(scoped_df, extract_requested_limit(resolved_prompt), scope_label=scoped_label)
 
     if "category" in prompt_lower:
         return category_summary(dataframe)
@@ -502,11 +594,11 @@ def answer_brandbot(prompt, dataframe):
     if "list" in prompt_lower and "brand" in prompt_lower and not any(word in prompt_lower for word in ["top", "best", "highest"]):
         return list_brands_summary(dataframe)
 
-    if any(word in prompt_lower for word in ["lowest", "worst", "least"]):
-        return top_brands_summary(dataframe, extract_requested_limit(prompt), ascending=True)
+    if has_any_word(prompt_lower, LOWEST_RANKING_WORDS):
+        return top_brands_summary(dataframe, extract_requested_limit(resolved_prompt), ascending=True)
 
-    if any(word in prompt_lower for word in ["top", "best", "highest", "rank", "leader"]):
-        return top_brands_summary(dataframe, extract_requested_limit(prompt))
+    if has_any_word(prompt_lower, RANKING_WORDS):
+        return top_brands_summary(dataframe, extract_requested_limit(resolved_prompt))
 
     if any(word in prompt_lower for word in ["revenue", "sales", "units", "total"]):
         return revenue_summary(scoped_df if scoped_label else dataframe, scoped_label)
@@ -760,6 +852,8 @@ elif app_mode == "AI Intelligence Chat":
         st.session_state.messages = [
             {"role": "assistant", "content": "Welcome to the BrandPulse Intelligence Feed. I am BrandBot. Ask me about brands, categories, revenue, platforms, regions, trends, or anomalies."}
         ]
+    if "brandbot_context" not in st.session_state:
+        st.session_state.brandbot_context = None
         
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -770,7 +864,12 @@ elif app_mode == "AI Intelligence Chat":
         with st.chat_message("user"):
             st.write(prompt)
             
-        response = answer_brandbot(prompt, merged_df)
+        previous_context = st.session_state.brandbot_context
+        resolved_prompt = resolve_followup_prompt(prompt, previous_context, merged_df)
+        response = answer_brandbot(prompt, merged_df, previous_context)
+        new_context = infer_prompt_intent(resolved_prompt, merged_df)
+        if new_context:
+            st.session_state.brandbot_context = new_context
             
         st.session_state.messages.append({"role": "assistant", "content": response})
         with st.chat_message("assistant"):
